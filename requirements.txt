@@ -1,0 +1,4 @@
+certifi==2026.6.17
+pillow==12.2.0
+PyAFF==0.1
+wheel==0.45.1
