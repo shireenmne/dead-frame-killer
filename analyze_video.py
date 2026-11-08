@@ -1,9 +1,12 @@
 import cv2
+import numpy as np
 import base64
 from openai import OpenAI
 
-VIDEO_PATH = "semantic_test.mp4"
-SAMPLE_EVERY_N_SECONDS = 1
+VIDEO_PATH = "test_assets/semantic_test.mp4"
+PIXEL_THRESHOLD = 25         
+MOTION_THRESHOLD = 0.0005   
+MIN_STATIC_SECONDS = 2.0    
 
 client = OpenAI(
     base_url="http://localhost:13305/api/v1",
@@ -14,68 +17,64 @@ def encode_frame(frame):
     success, buffer = cv2.imencode(".jpg", frame)
     return base64.b64encode(buffer).decode("utf-8")
 
-def is_dead_frame(base64_image):
+def label_dead_region(frame):
     response = client.chat.completions.create(
         model="Gemma-4-E2B-it-GGUF",
         temperature=0,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Is this frame a black screen, a frozen/stagnant shot, or otherwise 'dead space' with no meaningful visual action? Answer with exactly one word: YES or NO."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                    }
-                ]
-            }
-        ]
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "In 3-5 words, describe what this static frame shows (e.g. 'black screen', 'frozen shot of a person')."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_frame(frame)}"}}
+            ]
+        }]
     )
-    answer = response.choices[0].message.content.strip().upper()
-    return "YES" in answer
+    return response.choices[0].message.content.strip()
+
+def motion_score(gray, prev_gray):
+    diff = cv2.absdiff(gray, prev_gray)
+    return np.count_nonzero(diff > PIXEL_THRESHOLD) / diff.size
 
 cap = cv2.VideoCapture(VIDEO_PATH)
 fps = cap.get(cv2.CAP_PROP_FPS)
-frame_interval = int(fps * SAMPLE_EVERY_N_SECONDS)
+min_static_frames = int(MIN_STATIC_SECONDS * fps)
 
+prev_gray = None
 frame_count = 0
-raw_results = [] 
+region_start_frame = None   
+region_sample = None       
+regions = []            
 
-print(f"Analyzing {VIDEO_PATH} (FPS: {fps})...\n")
+def close_region(end_frame):
+    if region_start_frame is not None and (end_frame - region_start_frame) >= min_static_frames:
+        regions.append((region_start_frame / fps, end_frame / fps, region_sample))
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    if frame_count % frame_interval == 0:
-        timestamp = frame_count / fps
-        base64_frame = encode_frame(frame)
-        dead = is_dead_frame(base64_frame)
-        raw_results.append((timestamp, dead))
-        print(f"t={timestamp:5.1f}s  →  {'DEAD' if dead else 'live'}")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    score = motion_score(gray, prev_gray) if prev_gray is not None else 1.0
 
+    if frame_count % 15 == 0: 
+        print(f"t={frame_count / fps:5.2f}s  motion={score:.5f}")
+
+    if score < MOTION_THRESHOLD:
+        if region_start_frame is None:
+            region_start_frame = frame_count
+            region_sample = frame.copy()
+    else:
+        close_region(frame_count)
+        region_start_frame, region_sample = None, None
+
+    prev_gray = gray
     frame_count += 1
 
+close_region(frame_count)  
 cap.release()
 
-confirmed_dead = []
 
-for i, (timestamp, dead) in enumerate(raw_results):
-    if not dead:
-        continue
-
-    prev_dead = raw_results[i - 1][1] if i > 0 else False
-    next_dead = raw_results[i + 1][1] if i < len(raw_results) - 1 else False
-
-    if prev_dead or next_dead:
-        confirmed_dead.append(timestamp)
-    else:
-        print(f"Ignoring likely false positive at t={timestamp:.1f}s (isolated flag)")
-
-print(f"\n--- Summary ---")
-print(f"Raw flags: {[t for t, d in raw_results if d]}")
-print(f"Confirmed dead moments (after filtering): {confirmed_dead}")
+print(f"\n--- Confirmed dead regions: {len(regions)} ---\n")
+for start, end, sample in regions:
+    print(f"t={start:.1f}s - t={end:.1f}s  ({end - start:.1f}s)  →  {label_dead_region(sample)}")
