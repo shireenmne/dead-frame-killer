@@ -220,3 +220,7 @@ __marimo__/
 *.jpg
 *.jpeg
 *.png
+
+.DS_Store
+!test_assets/semantic_test.mp4
+!test_assets/duplicate_test.mp4
